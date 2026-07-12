@@ -223,4 +223,10 @@ CLAUDE.md
 # C build outputs
 palletguard
 test_frame_source
+test_alerts
+gpio_test
+out/
+logs/
 *.o
+*.a
+*.d
