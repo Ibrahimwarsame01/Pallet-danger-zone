@@ -219,3 +219,10 @@ __marimo__/
 
 # Claude Code
 CLAUDE.md
+
+# C build artifacts (Role D)
+out/
+logs/
+*.o
+*.a
+*.d
