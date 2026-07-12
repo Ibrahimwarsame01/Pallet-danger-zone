@@ -7,7 +7,6 @@
 #include "reference_detector.h"
 
 #include <opencv2/core/core_c.h>
-#include <opencv2/imgcodecs/imgcodecs_c.h>
 #include <opencv2/imgproc/imgproc_c.h>
 #include <opencv2/imgproc/types_c.h>
 
@@ -60,35 +59,43 @@ static CvRect resolve_roi(const IplImage *img, CvRect roi)
     return roi;
 }
 
-ReferenceDetector *reference_detector_create(const char *reference_path,
+ReferenceDetector *reference_detector_create(IplImage *reference_image,
                                              int roi_x, int roi_y,
                                              int roi_w, int roi_h,
                                              int pixel_threshold,
                                              double occupancy_trigger,
                                              int persistence)
 {
-    if (!reference_path) {
-        fprintf(stderr, "[reference_detector] reference_path is NULL\n");
+    if (!reference_image) {
+        fprintf(stderr, "[reference_detector] reference_image is NULL — "
+                        "load it (e.g. via fallback_source) and pass in\n");
         return NULL;
     }
 
-    IplImage *loaded = cvLoadImage(reference_path, CV_LOAD_IMAGE_GRAYSCALE);
-    if (!loaded) {
-        fprintf(stderr, "[reference_detector] failed to load: %s\n", reference_path);
+    /* Clone the input as an owned grayscale buffer so the caller can free
+     * their image immediately and we don't depend on their storage lifetime. */
+    IplImage *owned_gray =
+        cvCreateImage(cvGetSize(reference_image), IPL_DEPTH_8U, 1);
+    if (!owned_gray) return NULL;
+
+    if (!to_gray(owned_gray, reference_image)) {
+        fprintf(stderr, "[reference_detector] unsupported channel count: %d\n",
+                reference_image->nChannels);
+        cvReleaseImage(&owned_gray);
         return NULL;
     }
 
     ReferenceDetector *rd = (ReferenceDetector *)calloc(1, sizeof(ReferenceDetector));
-    if (!rd) { cvReleaseImage(&loaded); return NULL; }
+    if (!rd) { cvReleaseImage(&owned_gray); return NULL; }
 
-    rd->ref_gray          = loaded;
+    rd->ref_gray          = owned_gray;
     rd->roi               = cvRect(roi_x, roi_y, roi_w, roi_h);
     rd->pixel_threshold   = (pixel_threshold < 0) ? 25 : pixel_threshold;
     rd->occupancy_trigger = (occupancy_trigger <= 0.0) ? 0.08 : occupancy_trigger;
     rd->persistence       = (persistence < 1) ? 1 : persistence;
 
-    fprintf(stderr, "[reference_detector] loaded %s (%dx%d), roi=(%d,%d,%d,%d)\n",
-            reference_path, loaded->width, loaded->height,
+    fprintf(stderr, "[reference_detector] initialized %dx%d, roi=(%d,%d,%d,%d)\n",
+            owned_gray->width, owned_gray->height,
             rd->roi.x, rd->roi.y, rd->roi.width, rd->roi.height);
     return rd;
 }
