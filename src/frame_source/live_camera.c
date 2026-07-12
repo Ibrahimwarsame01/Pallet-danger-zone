@@ -28,12 +28,36 @@ static uint64_t now_ms(void) {
 #ifdef __QNXNTO__
 
 #include <camera/camera_api.h>
+#include <camera/camera_3a.h>   /* camera_set_3a_lock */
 
 #define REQ_WIDTH             640
 #define REQ_HEIGHT            480
 #define REQ_FPS               30.0
 #define FIRST_FRAME_TIMEOUT_S 5
 #define FRAME_TIMEOUT_S       2
+
+/* Freeze exposure after warmup: the reference and motion detectors diff raw
+ * pixel values, and measured AE drift alone shifts 20-50 gray levels across
+ * the whole frame over a few minutes — far above any usable pixel threshold.
+ * The Pi camera driver supports no 3A lock and no auto WB control (probed:
+ * lock modes = NONE, wb modes = DEFAULT only), but it does support
+ * CAMERA_EXPOSUREMODE_ISO_SHUTTER_PRIORITY with manual ISO (112..960) and
+ * manual shutter in MICROSECONDS (1..65487). So after warmup we switch to
+ * that mode and feedback-tune ISO+shutter until mean frame brightness lands
+ * in [EXP_MEAN_LO, EXP_MEAN_HI], then leave the values frozen. */
+#define EXP_WARMUP_FRAMES 30
+#define EXP_SETTLE_FRAMES 8     /* frames to wait after each set before measuring */
+#define EXP_MAX_ITERS     6
+#define EXP_MEAN_LO       70
+#define EXP_MEAN_HI       150
+#define EXP_MEAN_TARGET   110.0
+
+/* Indoor lights flicker at 2x the mains frequency; a shutter that is not a
+ * whole multiple of the half-cycle rolls visible bands through every frame
+ * (measured: +/-50 gray levels frame-to-frame). Snap shutter to multiples of
+ * this and let ISO absorb the brightness difference.
+ * 8333 us = 60 Hz mains; use 10000.0 for 50 Hz regions. */
+#define EXP_FLICKER_HALF_PERIOD_US 8333.0
 
 struct LiveCamera {
     camera_handle_t handle;
@@ -47,7 +71,103 @@ struct LiveCamera {
     bool            running;
     int             next_frame_id;
     Frame           frame;
+
+    /* manual-exposure freeze state */
+    enum { EXP_AUTO = 0, EXP_TUNING, EXP_FROZEN } exp_state;
+    int      exp_iter;
+    int      exp_settle;
+    unsigned iso_lo, iso_hi, cur_iso;
+    double   sh_lo, sh_hi, cur_sh;   /* shutter, driver units (microseconds) */
 };
+
+/* Mean brightness of a BGR frame, sparsely sampled. */
+static double frame_mean(const IplImage *img) {
+    if (!img) return 0.0;
+    long sum = 0, cnt = 0;
+    for (int y = 0; y < img->height; y += 16) {
+        const uint8_t *row = (const uint8_t *)img->imageData + (size_t)y * img->widthStep;
+        for (int x = 0; x < img->width; x += 16) {
+            const uint8_t *p = row + (size_t)x * img->nChannels;
+            sum += p[0] + p[1] + p[2];
+            cnt += 3;
+        }
+    }
+    return cnt ? (double)sum / cnt : 0.0;
+}
+
+static double clampd(double v, double lo, double hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void exp_apply(LiveCamera *cam) {
+    camera_set_manual_iso(cam->handle, cam->cur_iso);
+    camera_set_manual_shutter_speed(cam->handle, cam->cur_sh);
+    cam->exp_settle = 0;
+}
+
+/* Switch to ISO+shutter priority and start the brightness feedback loop. */
+static void exp_begin(LiveCamera *cam) {
+    if (camera_set_exposure_mode(cam->handle,
+            CAMERA_EXPOSUREMODE_ISO_SHUTTER_PRIORITY) != CAMERA_EOK) {
+        fprintf(stderr, "[live_camera] warning: manual exposure unsupported; "
+                        "expect AE drift in reference diffs\n");
+        cam->exp_state = EXP_FROZEN;
+        return;
+    }
+    unsigned n = 0; bool maxmin = false;
+    unsigned isos[2] = { 400, 400 };
+    double   shs[2]  = { 16667.0, 16667.0 };
+    cam->iso_lo = 112; cam->iso_hi = 960;         /* probed defaults */
+    if (camera_get_supported_manual_iso_values(cam->handle, 2, &n, isos, &maxmin)
+            == CAMERA_EOK && n >= 2) {
+        cam->iso_lo = isos[0] < isos[1] ? isos[0] : isos[1];
+        cam->iso_hi = isos[0] < isos[1] ? isos[1] : isos[0];
+    }
+    cam->sh_lo = 1.0; cam->sh_hi = 65487.0;
+    if (camera_get_supported_manual_shutter_speeds(cam->handle, 2, &n, shs, &maxmin)
+            == CAMERA_EOK && n >= 2) {
+        cam->sh_lo = shs[0] < shs[1] ? shs[0] : shs[1];
+        cam->sh_hi = shs[0] < shs[1] ? shs[1] : shs[0];
+    }
+    cam->cur_iso = (unsigned)clampd(400, cam->iso_lo, cam->iso_hi);
+    cam->cur_sh  = clampd(2.0 * EXP_FLICKER_HALF_PERIOD_US,
+                          cam->sh_lo, cam->sh_hi);  /* ~1/60 s, flicker-safe */
+    exp_apply(cam);
+    cam->exp_iter  = 0;
+    cam->exp_state = EXP_TUNING;
+}
+
+/* One tuning step: nudge shutter (then ISO at the rails) toward the target
+ * mean, or freeze if brightness is already acceptable. */
+static void exp_tune(LiveCamera *cam, const IplImage *img) {
+    if (++cam->exp_settle < EXP_SETTLE_FRAMES) return;
+
+    double mean = frame_mean(img);
+    if ((mean >= EXP_MEAN_LO && mean <= EXP_MEAN_HI) ||
+        cam->exp_iter >= EXP_MAX_ITERS) {
+        cam->exp_state = EXP_FROZEN;
+        fprintf(stderr, "[live_camera] exposure frozen: iso=%u shutter=%.0fus "
+                        "mean=%.0f (%s)\n",
+                cam->cur_iso, cam->cur_sh, mean,
+                cam->exp_iter >= EXP_MAX_ITERS ? "iteration cap" : "in band");
+        return;
+    }
+    double factor = clampd(EXP_MEAN_TARGET / (mean < 1.0 ? 1.0 : mean), 0.3, 3.5);
+    double want   = cam->cur_sh * factor;
+    /* snap to a flicker-safe multiple of the mains half-cycle (min 1 cycle) */
+    double cycles = (double)(long)(want / EXP_FLICKER_HALF_PERIOD_US + 0.5);
+    if (cycles < 1.0) cycles = 1.0;
+    double sh = clampd(cycles * EXP_FLICKER_HALF_PERIOD_US, cam->sh_lo, cam->sh_hi);
+    if (want != sh) {
+        /* snapping/rails changed the light gathered — push the rest into ISO */
+        double iso = clampd((double)cam->cur_iso * (want / sh),
+                            (double)cam->iso_lo, (double)cam->iso_hi);
+        cam->cur_iso = (unsigned)iso;
+    }
+    cam->cur_sh = sh;
+    cam->exp_iter++;
+    exp_apply(cam);
+}
 
 static uint8_t clamp8(int v) {
     return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
@@ -286,6 +406,12 @@ Frame *live_camera_read(LiveCamera *cam) {
     cam->frame.image        = cam->current;
     cam->frame.timestamp_ms = ts;
     cam->frame.frame_id     = cam->next_frame_id++;
+
+    if (cam->exp_state == EXP_AUTO && cam->frame.frame_id >= EXP_WARMUP_FRAMES) {
+        exp_begin(cam);
+    } else if (cam->exp_state == EXP_TUNING) {
+        exp_tune(cam, cam->frame.image);
+    }
     return &cam->frame;
 }
 

@@ -72,8 +72,55 @@ test: test_alerts
 gpio_test: src/alerts/gpio_alert.c scripts/gpio_test.c include/common_types.h
 	$(CC) $(CFLAGS) -Wextra -Werror $(SHIM_INC) -o $@ src/alerts/gpio_alert.c scripts/gpio_test.c
 
+# ---- No-OpenCV build: what actually runs on the QNX Pi image --------------
+# The Pi image ships gcc/make but NO OpenCV, so this path builds the full app
+# against the bundled tools/minicv shim instead. Excludes person_detector /
+# tflite (need real OpenCV) and angle_detector (needs contours; occupancy-only
+# is the PRD-blessed fallback). main.c covers person-in-zone via zone presence.
+#
+#   make nocv    # build ./palletguard (works on the Pi AND on any Linux host)
+#   make demo    # build + replay recorded footage -> terminal alarm + LED/buzzer
+#   make live    # build + run live camera (Ctrl-C to stop)
+
+NOCV_SRC := src/main.c $(FRAME_SRC) \
+            src/instability/motion_detector.c \
+            src/instability/reference_detector.c \
+            src/zone/zone_check.c src/zone/state_machine.c \
+            $(ALERTS_SRC) \
+            tools/minicv/mini_cv_core.c
+
+ifeq ($(shell uname -s),QNX)
+NOCV_LIBS := -lcamapi
+else
+NOCV_LIBS :=
+endif
+
+nocv:
+	mkdir -p out logs
+	gcc -Wall -Wextra -O2 -Iinclude -Isrc -Isrc/frame_source -Isrc/alerts \
+	    -Itools/minicv -o palletguard $(NOCV_SRC) $(NOCV_LIBS) -lm
+	@echo "built: ./palletguard"
+
+# Old footage's lean measures 21-35%, so the replay uses a 15% trigger;
+# live default is 40% (set in main.c, override with --occ PCT).
+demo: nocv
+	./palletguard --fallback assets/fallback_footage --reference assets/reference --frames 200 --occ 15
+
+live: nocv
+	./palletguard --live
+
+# Recapture the safe reference from the live camera (box upright, scene still,
+# nobody in frame). Run this whenever the camera has been moved, then make live.
+ref:
+	@echo "Capturing reference: box upright, scene still, step out of frame..."
+	rm -rf out/refcap
+	mkdir -p out/refcap assets/reference
+	./test_frame_source --live --frames 90 --record out/refcap >/dev/null
+	cp `ls out/refcap/*.bmp | tail -1` assets/reference/reference.bmp
+	@echo "new reference installed: assets/reference/reference.bmp"
+
 clean:
 	rm -f palletguard test_frame_source test_alerts gpio_test *.o
 	rm -rf out
 
-.PHONY: all test clean
+.PHONY: all test clean nocv demo live ref
