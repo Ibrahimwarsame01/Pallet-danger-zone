@@ -219,3 +219,8 @@ __marimo__/
 
 # Claude Code
 CLAUDE.md
+
+# C build outputs
+palletguard
+test_frame_source
+*.o
