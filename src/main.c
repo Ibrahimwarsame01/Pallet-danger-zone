@@ -44,7 +44,11 @@
 #define DEF_MOTION_AREA_TRIG   0.05
 #define DEF_MOTION_PERSIST     3
 #define DEF_REF_PIXEL_THR      25
-#define DEF_REF_OCC_TRIG       0.65  /* lean must move >65% of the ROI to alarm */
+#define DEF_REF_OCC_TRIG       0.40  /* lean must move >40% of the ROI to alarm.
+                                      * Kept well under the silhouette shift of a
+                                      * side-on lean: tipping toward/away from the
+                                      * lens changes far fewer pixels, and a high
+                                      * trigger simply misses those. */
 #define DEF_REF_PERSIST        3
 #define DEF_STABLE_THRESHOLD   15     /* frames of calm before back to NORMAL */
 #define DEF_ZONE_PIXEL_THR     25
@@ -162,7 +166,7 @@ static void usage(const char *argv0) {
         "          [--reference DIR]        (default assets/reference)\n"
         "          [--roi X Y W H]          (pallet region; default centered upper block)\n"
         "          [--zone X1 Y1 X2 Y2 X3 Y3 X4 Y4]  (danger quad; default lower floor)\n"
-        "          [--occ PCT]              (lean trigger, %% of ROI changed; default 65)\n"
+        "          [--occ PCT]              (lean trigger, %% of ROI changed; default 40)\n"
         "          [--frames N]             (0 = run until source ends / Ctrl-C)\n"
         "          [--dump N]               (write annotated BMP every N frames to out/)\n",
         argv0);
